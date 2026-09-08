@@ -1,0 +1,290 @@
+const express = require("express");
+const OpenAI = require("openai");
+require("dotenv").config();
+
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL
+});
+
+const app = express();
+
+app.use(express.json());
+app.use(express.static("public"));
+
+const client = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
+
+
+// ========================================
+// TEST DU SERVEUR
+// ========================================
+
+app.get("/test", (req, res) => {
+
+    res.json({
+        ok: true
+    });
+
+});
+
+
+// ========================================
+// TEST DE POSTGRESQL
+// ========================================
+
+app.get("/db-test", async (req, res) => {
+
+    try {
+
+        const result = await pool.query("SELECT NOW()");
+
+        res.json({
+            ok: true,
+            database: "Connexion à PostgreSQL établie",
+            time: result.rows[0].now
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            ok: false,
+            error: "Impossible de contacter PostgreSQL"
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRÉATION D'UN COMPTE
+// ========================================
+
+app.post("/api/register", async (req, res) => {
+
+    try {
+
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+
+            return res.status(400).json({
+                error: "Email et mot de passe obligatoires"
+            });
+
+        }
+
+        const passwordHash = await bcrypt.hash(password, 10);
+
+        const result = await pool.query(
+
+            `INSERT INTO users (email, password_hash)
+             VALUES ($1, $2)
+             RETURNING id, email, created_at`,
+
+            [email, passwordHash]
+
+        );
+
+        res.json({
+            ok: true,
+            user: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        if (error.code === "23505") {
+
+            return res.status(409).json({
+                error: "Cette adresse email existe déjà"
+            });
+
+        }
+
+        res.status(500).json({
+            error: "Impossible de créer le compte"
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CONNEXION UTILISATEUR
+// ========================================
+
+app.post("/api/login", async (req, res) => {
+
+    try {
+
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+
+            return res.status(400).json({
+                error: "Email et mot de passe obligatoires"
+            });
+
+        }
+
+        const result = await pool.query(
+
+            `SELECT id, email, password_hash
+             FROM users
+             WHERE email = $1`,
+
+            [email]
+
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(401).json({
+                error: "Email ou mot de passe incorrect"
+            });
+
+        }
+
+        const user = result.rows[0];
+
+        const passwordCorrect = await bcrypt.compare(
+            password,
+            user.password_hash
+        );
+
+        if (!passwordCorrect) {
+
+            return res.status(401).json({
+                error: "Email ou mot de passe incorrect"
+            });
+
+        }
+
+        const token = jwt.sign(
+
+            {
+                userId: user.id,
+                email: user.email
+            },
+
+            process.env.JWT_SECRET,
+
+            {
+                expiresIn: "7d"
+            }
+
+        );
+
+        res.json({
+
+            ok: true,
+
+            message: "Connexion réussie",
+
+            token: token,
+
+            user: {
+                id: user.id,
+                email: user.email
+            }
+
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            error: "Impossible de se connecter"
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CHATTER AVEC HATIMEDIA
+// ========================================
+
+app.post("/api/chat", async (req, res) => {
+
+    console.log(req.body.messages);
+
+    try {
+
+        const response = await client.responses.create({
+
+            model: "gpt-5",
+
+            instructions: `
+Tu es HATIMEDIA, mon assistant IA personnel.
+
+Ton nom est toujours HATIMEDIA.
+
+Tu réponds toujours en français, sauf si l'utilisateur demande une autre langue.
+
+Tu es chaleureux, patient, clair et encourageant.
+
+Tu expliques les choses simplement et étape par étape,
+surtout lorsqu'il s'agit de sujets techniques.
+
+Tu évites les explications inutilement compliquées.
+
+Si l'utilisateur rencontre un problème,
+tu cherches d'abord à comprendre précisément
+ce qui se passe avant de proposer une solution.
+
+Tu ne demandes pas à l'utilisateur de recommencer
+tout son travail si une correction ciblée suffit.
+
+Tu gardes un ton naturel, sympathique et humain.
+
+Lorsque l'utilisateur te demande ton nom,
+tu réponds que tu t'appelles HATIMEDIA.
+
+Tu considères HATIMEDIA comme l'identité de cet assistant.
+`,
+
+            input: req.body.messages
+
+        });
+
+        res.json({
+            reply: response.output_text
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            error: "Erreur lors de la communication avec OpenAI"
+        });
+
+    }
+
+});
+
+
+// ========================================
+// DÉMARRAGE DU SERVEUR
+// ========================================
+
+app.listen(3000, () => {
+
+    console.log(
+        "Serveur démarré sur http://localhost:3000"
+    );
+
+});

@@ -1,0 +1,446 @@
+const express = require("express");
+const OpenAI = require("openai");
+require("dotenv").config();
+
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL
+});
+
+const app = express();
+
+app.use(express.json());
+app.use(express.static("public"));
+
+const client = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
+
+
+// ========================================
+// TEST DU SERVEUR
+// ========================================
+
+app.get("/test", (req, res) => {
+
+    res.json({
+        ok: true
+    });
+
+});
+
+
+// ========================================
+// TEST DE POSTGRESQL
+// ========================================
+
+app.get("/db-test", async (req, res) => {
+
+    try {
+
+        const result = await pool.query("SELECT NOW()");
+
+        res.json({
+            ok: true,
+            database: "Connexion à PostgreSQL établie",
+            time: result.rows[0].now
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            ok: false,
+            error: "Impossible de contacter PostgreSQL"
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CRÉATION D'UN COMPTE
+// ========================================
+
+app.post("/api/register", async (req, res) => {
+
+    try {
+
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+
+            return res.status(400).json({
+                error: "Email et mot de passe obligatoires"
+            });
+
+        }
+
+        const passwordHash = await bcrypt.hash(password, 10);
+
+        const result = await pool.query(
+
+            `INSERT INTO users (email, password_hash)
+             VALUES ($1, $2)
+             RETURNING id, email, created_at`,
+
+            [email, passwordHash]
+
+        );
+
+        res.json({
+            ok: true,
+            user: result.rows[0]
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        if (error.code === "23505") {
+
+            return res.status(409).json({
+                error: "Cette adresse email existe déjà"
+            });
+
+        }
+
+        res.status(500).json({
+            error: "Impossible de créer le compte"
+        });
+
+    }
+
+});
+
+
+// ========================================
+// CONNEXION UTILISATEUR
+// ========================================
+
+app.post("/api/login", async (req, res) => {
+
+    try {
+
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+
+            return res.status(400).json({
+                error: "Email et mot de passe obligatoires"
+            });
+
+        }
+
+        const result = await pool.query(
+
+            `SELECT id, email, password_hash
+             FROM users
+             WHERE email = $1`,
+
+            [email]
+
+        );
+
+        if (result.rows.length === 0) {
+
+            return res.status(401).json({
+                error: "Email ou mot de passe incorrect"
+            });
+
+        }
+
+        const user = result.rows[0];
+
+        const passwordCorrect = await bcrypt.compare(
+            password,
+            user.password_hash
+        );
+
+        if (!passwordCorrect) {
+
+            return res.status(401).json({
+                error: "Email ou mot de passe incorrect"
+            });
+
+        }
+
+        const token = jwt.sign(
+
+            {
+                userId: user.id,
+                email: user.email
+            },
+
+            process.env.JWT_SECRET,
+
+            {
+                expiresIn: "7d"
+            }
+
+        );
+
+        res.json({
+
+            ok: true,
+
+            message: "Connexion réussie",
+
+            token: token,
+
+            user: {
+                id: user.id,
+                email: user.email
+            }
+
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            error: "Impossible de se connecter"
+        });
+
+    }
+
+});
+
+// ========================================
+// VÉRIFICATION DU TOKEN JWT
+// ========================================
+
+function verifierToken(req, res, next) {
+
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) {
+        return res.status(401).json({
+            error: "Token manquant"
+        });
+    }
+
+    const parts = authHeader.split(" ");
+
+    if (parts.length !== 2 || parts[0] !== "Bearer" || !parts[1]) {
+        return res.status(401).json({
+            error: "Format du token incorrect"
+        });
+    }
+
+    try {
+
+        const decoded = jwt.verify(
+            parts[1],
+            process.env.JWT_SECRET
+        );
+
+        req.user = decoded;
+
+        next();
+
+    } catch (error) {
+
+        console.error(error);
+
+        return res.status(401).json({
+            error: "Token invalide ou expiré"
+        });
+    }
+}
+
+// ======================================= // MÉMOIRE AUTOMATIQUE // ======================================= 
+async function enregistrerSouvenir(userId, memory) { 
+  if (!memory || typeof memory !== "string") { 
+    return; 
+  } const texte = memory.trim(); 
+  if (!texte) { 
+    return; 
+  } 
+  await pool.query( `INSERT INTO memories (user_id, memory) VALUES ($1, $2)`, [userId, texte] ); 
+}
+
+
+
+// ========================================
+// CHATTER AVEC HATIMEDIA
+// ========================================
+
+
+app.post("/api/chat", verifierToken, async (req, res) => {
+
+    try {
+
+        const userId = req.user.userId;
+        const messages = req.body.messages;
+
+        if (!Array.isArray(messages) || messages.length === 0) {
+            return res.status(400).json({
+                error: "Messages manquants"
+            });
+        }
+
+        // 1. Chercher une conversation existante
+        let result = await pool.query(
+            `SELECT id
+             FROM conversations
+             WHERE user_id = $1
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [userId]
+        );
+
+        let conversationId;
+
+        // 2. Créer une conversation si nécessaire
+        if (result.rows.length === 0) {
+
+            result = await pool.query(
+                `INSERT INTO conversations (user_id, title)
+                 VALUES ($1, $2)
+                 RETURNING id`,
+                [userId, "Conversation avec HATIMEDIA"]
+            );
+
+            conversationId = result.rows[0].id;
+
+        } else {
+
+            conversationId = result.rows[0].id;
+
+        }
+
+        // 3. Récupérer le dernier message utilisateur
+        const dernierMessage = messages[messages.length - 1];
+
+        // 4. Enregistrer le message utilisateur
+        if (
+            dernierMessage &&
+            dernierMessage.role === "user" &&
+            typeof dernierMessage.content === "string"
+        ) {
+
+            await pool.query(
+                `INSERT INTO messages
+                 (conversation_id, role, content)
+                 VALUES ($1, $2, $3)`,
+                [
+                    conversationId,
+                    "user",
+                    dernierMessage.content
+                ]
+            );
+
+        }
+
+                // 5. Relire l'historique depuis PostgreSQL
+        const historiqueResult = await pool.query(
+            `SELECT role, content
+             FROM messages
+             WHERE conversation_id = $1
+             ORDER BY created_at ASC, id ASC`,
+            [conversationId]
+        );
+        // 5bis. Relire les souvenirs personnels depuis PostgreSQL
+const memoriesResult = await pool.query(
+    `SELECT memory
+     FROM memories
+     WHERE user_id = $1
+     ORDER BY created_at ASC, id ASC`,
+    [userId]
+);
+
+const memories = memoriesResult.rows.map((row) => row.memory);
+
+        const historique = historiqueResult.rows.map((message) => ({
+            role: message.role,
+            content: message.content
+        }));
+
+ // 6. Envoyer tout l'historique à HATIMEDIA
+        const response = await client.responses.create({
+
+            model: "gpt-5",
+
+      instructions: `
+Tu es HATIMEDIA, mon assistant IA personnel.
+
+Ton nom est toujours HATIMEDIA.
+
+Tu réponds toujours en français, sauf si l'utilisateur demande une autre langue.
+
+Tu es chaleureux, patient, clair et encourageant.
+
+Tu expliques les choses simplement et étape par étape,
+surtout lorsqu'il s'agit de sujets techniques.
+
+Tu évites les explications inutilement compliquées.
+
+Tu cherches d'abord à comprendre le problème
+avant de proposer une solution.
+
+Tu gardes un ton naturel, sympathique et humain.
+
+Voici les souvenirs personnels enregistrés pour cet utilisateur :
+
+${memories.join("\n")}
+
+Utilise ces souvenirs lorsque cela est pertinent.
+`,
+
+            input: historique
+
+        });
+
+        const reply = response.output_text;
+
+
+
+        // 6. Enregistrer la réponse de HATIMEDIA
+        await pool.query(
+            `INSERT INTO messages
+             (conversation_id, role, content)
+             VALUES ($1, $2, $3)`,
+            [
+                conversationId,
+                "assistant",
+                reply
+            ]
+        );
+
+        // 7. Retourner la réponse
+        res.json({
+            reply: reply,
+            conversationId: conversationId
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            error: "Erreur lors de la communication avec HATIMEDIA"
+        });
+
+    }
+
+});
+
+
+// ========================================
+// DÉMARRAGE DU SERVEUR
+// ========================================
+
+app.listen(3000, () => {
+
+    console.log(
+        "Serveur démarré sur http://localhost:3000"
+    );
+
+});

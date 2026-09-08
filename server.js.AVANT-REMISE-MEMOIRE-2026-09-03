@@ -1,0 +1,482 @@
+const express = require("express");
+const OpenAI = require("openai");
+require("dotenv").config();
+const bcrypt = require("bcrypt");
+const { Pool } = require("pg");
+const jwt = require("jsonwebtoken");
+const https = require("https");
+
+const app = express();
+
+app.use(express.json());
+app.use(express.static("public"));
+
+const client = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL
+});
+
+// ========================================
+// TEST SERVEUR
+// ========================================
+
+app.get("/test", (req, res) => {
+    res.json({ ok: true });
+});
+
+// ========================================
+// TEST BASE DE DONNÉES
+// ========================================
+
+app.get("/db-test", async (req, res) => {
+    try {
+        const result = await pool.query("SELECT NOW()");
+        res.json({
+            ok: true,
+            database: result.rows[0]
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            ok: false,
+            error: error.message
+        });
+    }
+});
+
+// ========================================
+// INSCRIPTION
+// ========================================
+
+app.post("/api/register", async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+            return res.status(400).json({
+                error: "Email et mot de passe obligatoires."
+            });
+        }
+
+        const hash = await bcrypt.hash(password, 10);
+
+        const result = await pool.query(
+            `INSERT INTO users (email, password_hash)
+             VALUES ($1, $2)
+             RETURNING id, email`,
+            [email, hash]
+        );
+
+        res.json({
+            ok: true,
+            user: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Erreur lors de l'inscription."
+        });
+    }
+});
+
+// ========================================
+// CONNEXION
+// ========================================
+
+app.post("/api/login", async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        const result = await pool.query(
+            "SELECT * FROM users WHERE email = $1",
+            [email]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(401).json({
+                error: "Identifiants incorrects."
+            });
+        }
+
+        const user = result.rows[0];
+
+        const ok = await bcrypt.compare(
+            password,
+            user.password_hash
+        );
+
+        if (!ok) {
+            return res.status(401).json({
+                error: "Identifiants incorrects."
+            });
+        }
+
+        const token = jwt.sign(
+            {
+                userId: user.id,
+                email: user.email
+            },
+            process.env.JWT_SECRET,
+            {
+                expiresIn: "7d"
+            }
+        );
+
+        res.json({
+            ok: true,
+            token: token
+        });
+
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            error: "Erreur lors de la connexion."
+        });
+    }
+});
+
+// ========================================
+// VÉRIFICATION TOKEN
+// ========================================
+
+function verifierToken(req, res, next) {
+
+    const auth = req.headers.authorization;
+
+    if (!auth || !auth.startsWith("Bearer ")) {
+        return res.status(401).json({
+            error: "Token manquant."
+        });
+    }
+
+    const token = auth.substring(7);
+
+    try {
+
+        const decoded = jwt.verify(
+            token,
+            process.env.JWT_SECRET
+        );
+
+        req.user = decoded;
+
+        next();
+
+    } catch (error) {
+
+        return res.status(401).json({
+            error: "Token invalide."
+        });
+    }
+}
+
+// ========================================
+// CHAT HATIMEDIA
+// ========================================
+
+app.post("/api/chat", verifierToken, async (req, res) => {
+
+    try {
+
+        const userId = req.user.userId;
+        const message = req.body.message;
+
+        if (!message) {
+            return res.status(400).json({
+                error: "Message vide."
+            });
+        }
+
+        let conversation = await pool.query(
+            `SELECT id
+             FROM conversations
+             WHERE user_id = $1
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [userId]
+        );
+
+        let conversationId;
+
+        if (conversation.rows.length === 0) {
+
+            const nouvelle = await pool.query(
+                `INSERT INTO conversations (user_id, title)
+                 VALUES ($1, $2)
+                 RETURNING id`,
+                [userId, "Conversation HATIMEDIA"]
+            );
+
+            conversationId = nouvelle.rows[0].id;
+
+        } else {
+
+            conversationId = conversation.rows[0].id;
+        }
+
+        await pool.query(
+            `INSERT INTO messages
+             (conversation_id, role, content)
+             VALUES ($1, $2, $3)`,
+            [
+                conversationId,
+                "user",
+                message
+            ]
+        );
+
+        const historique = await pool.query(
+            `SELECT role, content
+             FROM messages
+             WHERE conversation_id = $1
+             ORDER BY created_at ASC`,
+            [conversationId]
+        );
+
+        const response = await client.responses.create({
+
+            model: "gpt-5",
+
+            instructions:
+                "Tu es HATIMEDIA, un assistant IA personnel. " +
+                "Réponds en français de manière naturelle, claire, chaleureuse et utile.",
+
+            input: historique.rows.map(m => ({
+                role: m.role,
+                content: m.content
+            }))
+        });
+
+        const reply = response.output_text;
+
+        await pool.query(
+            `INSERT INTO messages
+             (conversation_id, role, content)
+             VALUES ($1, $2, $3)`,
+            [
+                conversationId,
+                "assistant",
+                reply
+            ]
+        );
+
+        res.json({
+            reply: reply,
+            conversationId: conversationId
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            error: "Erreur lors de la communication avec HATIMEDIA."
+        });
+    }
+});
+
+// ========================================
+// WEBHOOK META / MESSENGER
+// ========================================
+
+// Vérification du webhook par Meta
+
+app.get("/webhook", (req, res) => {
+
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
+    const challenge = req.query["hub.challenge"];
+
+    if (
+        mode === "subscribe" &&
+        token === process.env.META_WEBHOOK_VERIFY_TOKEN
+    ) {
+
+        console.log("✅ WEBHOOK META VÉRIFIÉ");
+
+        return res.status(200).send(challenge);
+    }
+
+    console.log("❌ ÉCHEC VÉRIFICATION WEBHOOK META");
+
+    return res.sendStatus(403);
+});
+
+// ========================================
+// RÉCEPTION DES MESSAGES MESSENGER
+// ========================================
+
+app.post("/webhook", async (req, res) => {
+
+    console.log("📩 WEBHOOK META REÇU");
+
+    console.log(
+        JSON.stringify(req.body, null, 2)
+    );
+
+    // Répondre immédiatement à Meta
+
+    res.sendStatus(200);
+
+    try {
+
+        if (req.body.object !== "page") {
+            return;
+        }
+
+        for (const entry of req.body.entry || []) {
+
+            for (const event of entry.messaging || []) {
+
+                const senderId = event.sender?.id;
+
+                const messageText = event.message?.text;
+
+                // Ignorer les événements sans message texte
+
+                if (!senderId || !messageText) {
+                    continue;
+                }
+
+                console.log(
+                    "👤 Message Messenger :",
+                    messageText
+                );
+
+                console.log(
+                    "🆔 Sender ID :",
+                    senderId
+                );
+
+                // ========================================
+                // OPENAI / HATIMEDIA
+                // ========================================
+
+                const response =
+                    await client.responses.create({
+
+                        model: "gpt-5",
+
+                        instructions:
+                            "Tu es HATIMEDIA, un assistant IA personnel. " +
+                            "Réponds en français de manière naturelle, claire et chaleureuse.",
+
+                        input: messageText
+                    });
+
+                const reply = response.output_text;
+
+                console.log(
+                    "🤖 Réponse HATIMEDIA :",
+                    reply
+                );
+
+                // ========================================
+                // ENVOI DE LA RÉPONSE À MESSENGER
+                // ========================================
+
+                const data = JSON.stringify({
+
+                    recipient: {
+                        id: senderId
+                    },
+
+                    messaging_type: "RESPONSE",
+
+                    message: {
+                        text: reply
+                    }
+                });
+
+                const options = {
+
+                    hostname: "graph.facebook.com",
+
+                    path:
+                        "/v26.0/me/messages?access_token=" +
+                        encodeURIComponent(
+                            process.env.PAGE_ACCESS_TOKEN
+                        ),
+
+                    method: "POST",
+
+                    headers: {
+
+                        "Content-Type":
+                            "application/json",
+
+                        "Content-Length":
+                            Buffer.byteLength(data)
+                    }
+                };
+
+                const request =
+                    https.request(
+                        options,
+                        responseMeta => {
+
+                            let body = "";
+
+                            responseMeta.on(
+                                "data",
+                                chunk => {
+                                    body += chunk;
+                                }
+                            );
+
+                            responseMeta.on(
+                                "end",
+                                () => {
+
+                                    console.log(
+                                        "📤 Réponse envoyée à Messenger :",
+                                        responseMeta.statusCode,
+                                        body
+                                    );
+                                }
+                            );
+                        }
+                    );
+
+                request.on(
+                    "error",
+                    error => {
+
+                        console.error(
+                            "❌ Erreur envoi Messenger :",
+                            error.message
+                        );
+                    }
+                );
+
+                request.write(data);
+
+                request.end();
+            }
+        }
+
+    } catch (error) {
+
+        console.error(
+            "❌ Erreur HATIMEDIA Messenger :",
+            error
+        );
+    }
+});
+
+// ========================================
+// DÉMARRAGE DU SERVEUR
+// ========================================
+
+app.listen(3000, () => {
+
+    console.log(
+        "Serveur démarré sur http://localhost:3000"
+    );
+});
